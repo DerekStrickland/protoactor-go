@@ -10,12 +10,12 @@ require (
 	github.com/emirpasic/gods v1.18.1
 	github.com/gogo/protobuf v1.3.2
 	github.com/google/uuid v1.3.0
-	github.com/hashicorp/consul/api v1.12.0
+	github.com/hashicorp/consul/api v1.13.0
 	github.com/opentracing/opentracing-go v1.2.0
 	github.com/orcaman/concurrent-map v1.0.0
 	github.com/serialx/hashring v0.0.0-20200727003509-22c0c7ab6b1b
 	github.com/spaolacci/murmur3 v1.1.0
-	github.com/stretchr/testify v1.7.1
+	github.com/stretchr/testify v1.8.0
 	go.opentelemetry.io/otel v1.7.0
 	go.opentelemetry.io/otel/exporters/prometheus v0.30.0
 	go.opentelemetry.io/otel/metric v0.30.0
@@ -39,6 +39,8 @@ require (
 	k8s.io/client-go v0.24.1
 )
 
+require github.com/hashicorp/cronexpr v1.1.1 // indirect
+
 require (
 	github.com/armon/go-metrics v0.4.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -57,12 +59,13 @@ require (
 	github.com/google/gnostic v0.6.9 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
-	github.com/hashicorp/go-hclog v1.2.0 // indirect
+	github.com/hashicorp/go-hclog v1.2.2 // indirect
 	github.com/hashicorp/go-immutable-radix v1.3.1 // indirect
-	github.com/hashicorp/go-msgpack v0.5.5 // indirect
+	github.com/hashicorp/go-msgpack v1.1.5 // indirect
 	github.com/hashicorp/go-rootcerts v1.0.2 // indirect
 	github.com/hashicorp/go-sockaddr v1.0.2 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
+	github.com/hashicorp/nomad-openapi v0.0.0-20220912131841-b34eb27dbe26
 	github.com/hashicorp/serf v0.9.8 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
@@ -81,7 +84,7 @@ require (
 	github.com/prometheus/client_model v0.2.0 // indirect
 	github.com/prometheus/common v0.34.0 // indirect
 	github.com/prometheus/procfs v0.7.3 // indirect
-	github.com/stretchr/objx v0.3.0 // indirect
+	github.com/stretchr/objx v0.4.0 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.1 // indirect
 	go.etcd.io/etcd/api/v3 v3.5.4 // indirect
@@ -91,8 +94,8 @@ require (
 	go.uber.org/atomic v1.9.0 // indirect
 	go.uber.org/multierr v1.8.0 // indirect
 	go.uber.org/zap v1.21.0 // indirect
-	golang.org/x/crypto v0.0.0-20220525230936-793ad666bf5e // indirect
-	golang.org/x/exp v0.0.0-20220518171630-0b5c67f07fdf // indirect
+	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d // indirect
+	golang.org/x/exp v0.0.0-20220609121020-a51bd0440498 // indirect
 	golang.org/x/oauth2 v0.0.0-20220524215830-622c5d57e401 // indirect
 	golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a // indirect
 	golang.org/x/term v0.0.0-20220526004731-065cf7ba2467 // indirect
