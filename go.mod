@@ -3,6 +3,9 @@ module github.com/asynkron/protoactor-go
 // because etcd/v3 need go 1.16 version
 go 1.18
 
+
+replace github.com/hashicorp/nomad-openapi => ../hashicorp/nomad-openapi
+
 require (
 	github.com/Workiva/go-datastructures v1.0.53
 	github.com/asynkron/gofun v0.0.0-20220329210725-34fed760f4c2

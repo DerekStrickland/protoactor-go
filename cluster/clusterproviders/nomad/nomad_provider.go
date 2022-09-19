@@ -1,207 +1,366 @@
 package nomad
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
-	"sync"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/asynkron/protoactor-go/actor"
-
 	"github.com/asynkron/protoactor-go/cluster"
 	"github.com/asynkron/protoactor-go/log"
-	"github.com/hashicorp/consul/api"
+	"github.com/google/uuid"
+	models "github.com/hashicorp/nomad-openapi/clients/go/v1"
 	v1 "github.com/hashicorp/nomad-openapi/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 )
 
-var ProviderShuttingDownError = fmt.Errorf("nomad cluster provider is shutting down")
+var (
+	watchTimeoutSeconds       int64 = 30
+	ProviderShuttingDownError       = fmt.Errorf("nomad cluster provider is being shut down")
+)
 
+// Convenience type to store meta tags
+type MetaTags map[string]string
+
+// This data structure implements a Nomad cluster provider for Proto.Actor
 type Provider struct {
-	cluster             *cluster.Cluster
-	deregistered        bool
-	shutdown            bool
-	id                  string
-	clusterName         string
-	address             string
-	port                int
-	knownKinds          []string
-	index               uint64 // nomad blocking index
-	client              *v1.Client
-	ttl                 time.Duration
-	refreshTTL          time.Duration
-	updateTTLWaitGroup  sync.WaitGroup
-	deregisterCritical  time.Duration
-	blockingWaitTime    time.Duration
-	clusterError        error
-	consulServerAddress string
-	pid                 *actor.PID
+	id             string
+	cluster        *cluster.Cluster
+	clusterName    string
+	nodeName        string
+	host           string
+	port           int
+	knownKinds     []string
+	allocations    map[string]*models.Allocation
+	clusterMonitor *actor.PID
+	deregistered   bool
+	shutdown       bool
+	watching       bool
+	client         *v1.Client
+	clientConfig   *v1.ClientConfig
 }
 
+// make sure our Provider complies with the ClusterProvider interface
+var _ cluster.ClusterProvider = (*Provider)(nil)
+
+// New crates a new nomad Provider in the heap and return back a reference to its memory address
 func New(opts ...Option) (*Provider, error) {
-	return NewWithConfig(&api.Config{}, opts...)
+	cfg := &v1.ClientConfig{} 
+	return NewWithConfig(cfg, opts...)
 }
 
-func NewWithConfig(consulConfig *api.Config, opts ...Option) (*Provider, error) {
-	client, err := api.NewClient(consulConfig)
+// NewWithConfig creates a new nomad Provider in the heap using the given configuration
+// and options, it returns a reference to its memory address or an error
+func NewWithConfig(cfg *v1.ClientConfig, opts ...Option) (*Provider, error) {
+	client, err := v1.NewClient(v1.ClientOptsCombined(cfg)...)
 	if err != nil {
 		return nil, err
 	}
-	p := &Provider{
-		client:              client,
-		ttl:                 3 * time.Second,
-		refreshTTL:          1 * time.Second,
-		deregisterCritical:  60 * time.Second,
-		blockingWaitTime:    20 * time.Second,
-		consulServerAddress: consulConfig.Address,
+
+	p := Provider{
+		client: client,
 	}
+
+	// process given options
 	for _, opt := range opts {
-		opt(p)
+		opt(&p)
 	}
-	return p, nil
+	return &p, nil
 }
 
+// initializes the cluster provider
 func (p *Provider) init(c *cluster.Cluster) error {
-	knownKinds := c.GetClusterKinds()
-	clusterName := c.Config.Name
-	memberId := c.ActorSystem.ID
-
 	host, port, err := c.ActorSystem.GetHostPort()
 	if err != nil {
 		return err
 	}
 
 	p.cluster = c
-	p.id = memberId
-	p.clusterName = clusterName
-	p.address = host
+	p.id = strings.Replace(uuid.New().String(), "-", "", -1)
+	p.knownKinds = c.GetClusterKinds()
+	p.clusterName = c.Config.Name
+	p.host = host
 	p.port = port
-	p.knownKinds = knownKinds
+	
 	return nil
 }
 
+// StartMember registers the member in the cluster and start it
 func (p *Provider) StartMember(c *cluster.Cluster) error {
-	err := p.init(c)
-	if err != nil {
+	if err := p.init(c); err != nil {
 		return err
 	}
 
-	p.pid, err = c.ActorSystem.Root.SpawnNamed(actor.PropsFromProducer(func() actor.Actor {
-		return newProviderActor(p)
-	}), "consul-provider")
-	if err != nil {
-		plog.Error("Failed to start consul-provider actor", log.Error(err))
+	if err := p.startClusterMonitor(c); err != nil {
 		return err
 	}
+
+	p.registerMemberAsync(c)
+	p.startWatchingClusterAsync(c)
 
 	return nil
 }
 
+// StartClient starts the nomad client and monitor watch
 func (p *Provider) StartClient(c *cluster.Cluster) error {
 	if err := p.init(c); err != nil {
 		return err
 	}
-	p.blockingStatusChange()
-	p.monitorMemberStatusChanges()
-	return nil
-}
 
-func (p *Provider) DeregisterMember() error {
-	err := p.deregisterService()
-	if err != nil {
-		fmt.Println(err)
+	if err := p.startClusterMonitor(c); err != nil {
 		return err
 	}
-	p.deregistered = true
+
+	p.startWatchingClusterAsync(c)
 	return nil
 }
 
 func (p *Provider) Shutdown(graceful bool) error {
 	if p.shutdown {
+		// we are already shut down or shutting down
 		return nil
 	}
-	p.shutdown = true
-	if p.pid != nil {
-		if err := p.cluster.ActorSystem.Root.StopFuture(p.pid).Wait(); err != nil {
-			plog.Error("Failed to stop consul-provider actor", log.Error(err))
-		}
-		p.pid = nil
-	}
 
+	p.shutdown = true
+	if p.clusterMonitor != nil {
+		if err := p.cluster.ActorSystem.Root.StopFuture(p.clusterMonitor).Wait(); err != nil {
+			plog.Error("Failed to stop nomad-provider actor", log.Error(err))
+		}
+		p.clusterMonitor = nil
+	}
 	return nil
 }
 
-func blockingUpdateTTL(p *Provider) error {
-	p.clusterError = p.client.Agent().UpdateTTL("service:"+p.id, "", api.HealthPassing)
-	return p.clusterError
-}
-
-func (p *Provider) registerService() error {
-	s := &api.AgentServiceRegistration{
-		ID:      p.id,
-		Name:    p.clusterName,
-		Tags:    p.knownKinds,
-		Address: p.address,
-		Port:    p.port,
-		Meta: map[string]string{
-			"id": p.id,
-		},
-		Check: &api.AgentServiceCheck{
-			DeregisterCriticalServiceAfter: p.deregisterCritical.String(),
-			TTL:                            p.ttl.String(),
-		},
-	}
-	return p.client.Agent().ServiceRegister(s)
-}
-
-func (p *Provider) deregisterService() error {
-	return p.client.Agent().ServiceDeregister(p.id)
-}
-
-// call this directly after registering the service
-func (p *Provider) blockingStatusChange() {
-	p.notifyStatuses()
-}
-
-func (p *Provider) notifyStatuses() {
-	statuses, meta, err := p.client.Health().Service(p.clusterName, "", false, &api.QueryOptions{
-		WaitIndex: p.index,
-		WaitTime:  p.blockingWaitTime,
-	})
-	plog.Info("Consul health check")
+// starts the cluster monitor in its own goroutine
+func (p *Provider) startClusterMonitor(c *cluster.Cluster) error {
+	var err error
+	p.clusterMonitor, err = c.ActorSystem.Root.SpawnNamed(actor.PropsFromProducer(func() actor.Actor {
+		return newClusterMonitor(p)
+	}), "nomad-cluster-monitor")
 
 	if err != nil {
-		plog.Error("notifyStatues", log.Error(err))
-		return
+		plog.Error("Failed to start nomad-cluster-monitor actor", log.Error(err))
+		return err
 	}
-	p.index = meta.LastIndex
 
-	var members []*cluster.Member
-	for _, v := range statuses {
-		if len(v.Checks) > 0 && v.Checks.AggregatedStatus() == api.HealthPassing {
-			memberId := v.Service.Meta["id"]
-			if memberId == "" {
-				memberId = fmt.Sprintf("%v@%v:%v", p.clusterName, v.Service.Address, v.Service.Port)
-				plog.Info("meta['id'] was empty, fixeds", log.String("id", memberId))
-			}
-			members = append(members, &cluster.Member{
-				Id:    memberId,
-				Host:  v.Service.Address,
-				Port:  int32(v.Service.Port),
-				Kinds: v.Service.Tags,
-			})
-		}
-	}
-	// the reason why we want this in a batch and not as individual messages is that
-	// if we have an atomic batch, we can calculate what nodes have left the cluster
-	// passing events one by one, we can't know if someone left or just haven't changed status for a long time
-
-	// publish the current cluster topology onto the event stream
-	p.cluster.MemberList.UpdateClusterTopology(members)
+	p.nodeName, _ = os.Hostname()
+	return nil
 }
 
-func (p *Provider) monitorMemberStatusChanges() {
+// registers itself as a member asynchronously using an actor
+func (p *Provider) registerMemberAsync(c *cluster.Cluster) {
+	msg := RegisterMember{}
+	c.ActorSystem.Root.Send(p.clusterMonitor, &msg)
+}
+
+// registers itself as a member in nomad cluster
+func (p *Provider) registerMember(timeout time.Duration) error {
+	plog.Info(fmt.Sprintf("Registering service %s on %s", p.nodeName, p.address))
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	pod, err := p.client.CoreV1().Pods(p.retrieveNamespace()).Get(ctx, p.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("unable to get own pod information for %s: %w", p.nodeName, err)
+	}
+
+	plog.Info(fmt.Sprintf("Using Kubernetes namespace: %s\nUsing Kubernetes port: %d", pod.Namespace, p.port))
+
+	labels := MetaTags{
+		LabelCluster:  p.clusterName,
+		LabelPort:     fmt.Sprintf("%d", p.port),
+		LabelMemberID: p.id,
+	}
+
+	// add known kinds to labels
+	for _, kind := range p.knownKinds {
+		labelkey := fmt.Sprintf("%s-%s", LabelKind, kind)
+		labels[labelkey] = "true"
+	}
+
+	// add existing labels back
+	for key, value := range pod.ObjectMeta.Labels {
+		labels[key] = value
+	}
+	pod.SetLabels(labels)
+
+	return p.replacePodLabels(ctx, pod)
+}
+
+func (p *Provider) startWatchingClusterAsync(c *cluster.Cluster) {
+	msg := StartWatchingCluster{p.clusterName}
+	c.ActorSystem.Root.Send(p.clusterMonitor, &msg)
+}
+
+func (p *Provider) startWatchingCluster(timeout time.Duration) error {
+	selector := fmt.Sprintf("%s=%s", LabelCluster, p.clusterName)
+	if p.watching {
+		plog.Info(fmt.Sprintf("Allocs for %s are being watched already", selector))
+	}
+
+	plog.Debug(fmt.Sprintf("Starting to watch allocs with %s", selector), log.String("selector", selector))
+
+	// error placeholder
+	var watcherr error
+
+	// start a new goroutine to monitor the cluster events
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		watcher, err := p.v1.Allocations(p.retrieveNamespace()).Watch(ctx, metav1.ListOptions{LabelSelector: selector, Watch: true, TimeoutSeconds: &watchTimeoutSeconds})
+		if err != nil {
+			watcherr = fmt.Errorf("unable to watch the cluster status: %w", err)
+			return
+		}
+
 		for !p.shutdown {
-			p.notifyStatuses()
+
+			event, ok := <-watcher.ResultChan()
+			if !ok {
+				plog.Error("watcher result channel closed abruptly")
+				break
+			}
+
+			pod, ok := event.Object.(*v1.Pod)
+			if !ok {
+				err := fmt.Errorf("could not cast %#v[%T] into v1.Pod", event.Object, event.Object)
+				plog.Error(err.Error(), log.Error(err))
+				continue
+			}
+
+			podClusterName, ok := pod.ObjectMeta.Labels[LabelCluster]
+			if !ok {
+				plog.Info(fmt.Sprintf("The pod %s is not a Proto.Cluster node", pod.ObjectMeta.Name))
+			}
+
+			if podClusterName != p.clusterName {
+				plog.Info(fmt.Sprintf("The pod %s is from another cluster %s", pod.ObjectMeta.Name, pod.ObjectMeta.Namespace))
+			}
+
+			switch event.Type {
+			case watch.Deleted:
+				delete(p.clusterPods, pod.UID)
+			case watch.Error:
+				err := apierrors.FromObject(event.Object)
+				plog.Error(err.Error(), log.Error(err))
+			default:
+				p.clusterPods[pod.UID] = pod
+			}
+
+			members := make([]*cluster.Member, 0, len(p.clusterPods))
+			for _, clusterPod := range p.clusterPods {
+				if clusterPod.Status.Phase == "Running" && len(clusterPod.Status.PodIPs) > 0 {
+
+					var kinds []string
+					for key, value := range clusterPod.ObjectMeta.Labels {
+						if strings.HasPrefix(key, LabelKind) && value == "true" {
+							kinds = append(kinds, strings.Replace(key, fmt.Sprintf("%s-", LabelKind), "", 1))
+						}
+					}
+
+					host := pod.Status.PodIP
+					port, err := strconv.Atoi(pod.ObjectMeta.Labels[LabelPort])
+					if err != nil {
+						err = fmt.Errorf("can not convert pod meta %s into integer: %w", LabelPort, err)
+						plog.Error(err.Error(), log.Error(err))
+						continue
+					}
+
+					mid := pod.ObjectMeta.Labels[LabelMemberID]
+					alive := true
+					for _, status := range pod.Status.ContainerStatuses {
+						if !status.Ready {
+							alive = false
+							break
+						}
+					}
+
+					if !alive {
+						continue
+					}
+
+					members = append(members, &cluster.Member{
+						Id:    mid,
+						Host:  host,
+						Port:  int32(port),
+						Kinds: kinds,
+					})
+				}
+			}
+
+			plog.Debug(fmt.Sprintf("Topology received from Kubernetes %#v", members))
+			p.cluster.MemberList.UpdateClusterTopology(members)
 		}
 	}()
+
+	return watcherr
+}
+
+// deregister itself as a member from a nomad cluster
+func (p *Provider) deregisterMember(timeout time.Duration) error {
+	plog.Info(fmt.Sprintf("Deregistering service %s from %s", p.nodeName, p.address))
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	pod, err := p.client.CoreV1().Pods(p.retrieveNamespace()).Get(ctx, p.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("unable to get own pod information for %s: %w", p.nodeName, err)
+	}
+
+	labels := pod.GetLabels()
+	for _, kind := range p.knownKinds {
+		delete(labels, fmt.Sprintf("%s-%s", LabelKind, kind))
+	}
+
+	delete(labels, LabelCluster)
+	pod.SetLabels(labels)
+
+	return p.replacePodLabels(ctx, pod)
+}
+
+// prepares a patching payload and sends it to kubernetes to replace labels
+func (p *Provider) replacePodLabels(ctx context.Context, pod *v1.Pod) error {
+	payload := []struct {
+		Op    string `json:"op"`
+		Path  string `json:"path"`
+		Value MetaTags `json:"value"`
+	}{
+		{
+			Op:    "replace",
+			Path:  "/metadata/labels",
+			Value: pod.GetLabels(),
+		},
+	}
+
+	payloadData, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("unable to update pod labels, operation failed: %w", err)
+	}
+
+	_, patcherr := p.client.CoreV1().Pods(pod.GetNamespace()).Patch(ctx, pod.GetName(), types.JSONPatchType, payloadData, metav1.PatchOptions{})
+	return patcherr
+}
+
+// get the namespace of the current pod
+func (p *Provider) retrieveNamespace() string {
+	if (p.namespace) == "" {
+		filename := filepath.Join(string(filepath.Separator), "var", "run", "secrets", "kubernetes.io", "serviceaccount", "namespace")
+		content, err := os.ReadFile(filename)
+		if err != nil {
+			plog.Warn(fmt.Sprintf("Could not read %s contents defaulting to empty namespace: %s", filename, err.Error()))
+			return p.namespace
+		}
+		p.namespace = string(content)
+	}
+
+	return p.namespace
 }
