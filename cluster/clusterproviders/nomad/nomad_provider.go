@@ -2,10 +2,8 @@ package nomad
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +14,6 @@ import (
 	"github.com/google/uuid"
 	models "github.com/hashicorp/nomad-openapi/clients/go/v1"
 	v1 "github.com/hashicorp/nomad-openapi/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/watch"
 )
 
@@ -30,10 +27,12 @@ type MetaTags map[string]string
 
 // This data structure implements a Nomad cluster provider for Proto.Actor
 type Provider struct {
+	ctx            actor.Context
 	id             string
 	cluster        *cluster.Cluster
 	clusterName    string
-	nodeName        string
+	nodeID         string
+	allocID        string
 	host           string
 	port           int
 	knownKinds     []string
@@ -44,6 +43,7 @@ type Provider struct {
 	watching       bool
 	client         *v1.Client
 	clientConfig   *v1.ClientConfig
+	lastIndex      uint64
 }
 
 // make sure our Provider complies with the ClusterProvider interface
@@ -51,7 +51,7 @@ var _ cluster.ClusterProvider = (*Provider)(nil)
 
 // New crates a new nomad Provider in the heap and return back a reference to its memory address
 func New(opts ...Option) (*Provider, error) {
-	cfg := &v1.ClientConfig{} 
+	cfg := &v1.ClientConfig{}
 	return NewWithConfig(cfg, opts...)
 }
 
@@ -87,7 +87,7 @@ func (p *Provider) init(c *cluster.Cluster) error {
 	p.clusterName = c.Config.Name
 	p.host = host
 	p.port = port
-	
+
 	return nil
 }
 
@@ -149,7 +149,14 @@ func (p *Provider) startClusterMonitor(c *cluster.Cluster) error {
 		return err
 	}
 
-	p.nodeName, _ = os.Hostname()
+	// Requires operators to set node_id in the jobspec meta using node attritbute variable interpolation
+	// job "nomad-actor" {
+	//   meta {
+	//     node-id = "${node.unique.id}"
+	//   }
+	// }
+	p.nodeID = os.Getenv("NOMAD_META_node-id")
+	p.allocID = os.Getenv("NOMAD_ALLOC_ID")
 	return nil
 }
 
@@ -161,37 +168,42 @@ func (p *Provider) registerMemberAsync(c *cluster.Cluster) {
 
 // registers itself as a member in nomad cluster
 func (p *Provider) registerMember(timeout time.Duration) error {
-	plog.Info(fmt.Sprintf("Registering service %s on %s", p.nodeName, p.address))
+	plog.Info(fmt.Sprintf("Registering nomad provider %s on %s", p.allocID, p.nodeID))
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	pod, err := p.client.CoreV1().Pods(p.retrieveNamespace()).Get(ctx, p.nodeName, metav1.GetOptions{})
+	alloc, queryMeta, err := p.client.Allocations().GetAllocation(ctx, p.allocID)
 	if err != nil {
-		return fmt.Errorf("unable to get own pod information for %s: %w", p.nodeName, err)
+		return fmt.Errorf("unable to get own alloc information for %s: %w", p.allocID, err)
 	}
 
-	plog.Info(fmt.Sprintf("Using Kubernetes namespace: %s\nUsing Kubernetes port: %d", pod.Namespace, p.port))
+	p.lastIndex = queryMeta.LastIndex
 
-	labels := MetaTags{
-		LabelCluster:  p.clusterName,
-		LabelPort:     fmt.Sprintf("%d", p.port),
-		LabelMemberID: p.id,
+	// TODO: Validate this port
+	plog.Info(fmt.Sprintf("Using nomad namespace: %s\nUsing nomad port: %d", alloc.Namespace, p.port))
+
+	metaTags := MetaTags{
+		MetaCluster:  p.clusterName,
+		MetaPort:     fmt.Sprintf("%d", p.port),
+		MetaMemberID: p.id,
 	}
 
-	// add known kinds to labels
+	// TODO: Determine what the known kinds should be.
+	// add known kinds to meta
 	for _, kind := range p.knownKinds {
-		labelkey := fmt.Sprintf("%s-%s", LabelKind, kind)
-		labels[labelkey] = "true"
+		metaKey := fmt.Sprintf("%s-%s", MetaKind, kind)
+		metaTags[metaKey] = "true"
 	}
 
-	// add existing labels back
-	for key, value := range pod.ObjectMeta.Labels {
-		labels[key] = value
+	// add existing meta back
+	for key, value := range *alloc.GetJob().Meta {
+		metaTags[key] = value
 	}
-	pod.SetLabels(labels)
 
-	return p.replacePodLabels(ctx, pod)
+	alloc.Job.SetMeta(metaTags)
+
+	return p.updateJobMeta(ctx, alloc.Job)
 }
 
 func (p *Provider) startWatchingClusterAsync(c *cluster.Cluster) {
@@ -200,7 +212,7 @@ func (p *Provider) startWatchingClusterAsync(c *cluster.Cluster) {
 }
 
 func (p *Provider) startWatchingCluster(timeout time.Duration) error {
-	selector := fmt.Sprintf("%s=%s", LabelCluster, p.clusterName)
+	selector := fmt.Sprintf("%s=%s", MetaCluster, p.clusterName)
 	if p.watching {
 		plog.Info(fmt.Sprintf("Allocs for %s are being watched already", selector))
 	}
@@ -210,12 +222,13 @@ func (p *Provider) startWatchingCluster(timeout time.Duration) error {
 	// error placeholder
 	var watcherr error
 
+	// TODO: Refactor to event stream
 	// start a new goroutine to monitor the cluster events
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
-		watcher, err := p.v1.Allocations(p.retrieveNamespace()).Watch(ctx, metav1.ListOptions{LabelSelector: selector, Watch: true, TimeoutSeconds: &watchTimeoutSeconds})
+		watcher, err := p.client.GetAllocations(p.retrieveNamespace()).Watch(ctx, metav1.ListOptions{LabelSelector: selector, Watch: true, TimeoutSeconds: &watchTimeoutSeconds})
 		if err != nil {
 			watcherr = fmt.Errorf("unable to watch the cluster status: %w", err)
 			return
@@ -236,7 +249,7 @@ func (p *Provider) startWatchingCluster(timeout time.Duration) error {
 				continue
 			}
 
-			podClusterName, ok := pod.ObjectMeta.Labels[LabelCluster]
+			podClusterName, ok := pod.ObjectMeta.Labels[MetaCluster]
 			if !ok {
 				plog.Info(fmt.Sprintf("The pod %s is not a Proto.Cluster node", pod.ObjectMeta.Name))
 			}
@@ -261,20 +274,20 @@ func (p *Provider) startWatchingCluster(timeout time.Duration) error {
 
 					var kinds []string
 					for key, value := range clusterPod.ObjectMeta.Labels {
-						if strings.HasPrefix(key, LabelKind) && value == "true" {
-							kinds = append(kinds, strings.Replace(key, fmt.Sprintf("%s-", LabelKind), "", 1))
+						if strings.HasPrefix(key, MetaKind) && value == "true" {
+							kinds = append(kinds, strings.Replace(key, fmt.Sprintf("%s-", MetaKind), "", 1))
 						}
 					}
 
 					host := pod.Status.PodIP
-					port, err := strconv.Atoi(pod.ObjectMeta.Labels[LabelPort])
+					port, err := strconv.Atoi(pod.ObjectMeta.Labels[MetaPort])
 					if err != nil {
-						err = fmt.Errorf("can not convert pod meta %s into integer: %w", LabelPort, err)
+						err = fmt.Errorf("can not convert pod meta %s into integer: %w", MetaPort, err)
 						plog.Error(err.Error(), log.Error(err))
 						continue
 					}
 
-					mid := pod.ObjectMeta.Labels[LabelMemberID]
+					mid := pod.ObjectMeta.Labels[MetaMemberID]
 					alive := true
 					for _, status := range pod.Status.ContainerStatuses {
 						if !status.Ready {
@@ -306,61 +319,39 @@ func (p *Provider) startWatchingCluster(timeout time.Duration) error {
 
 // deregister itself as a member from a nomad cluster
 func (p *Provider) deregisterMember(timeout time.Duration) error {
-	plog.Info(fmt.Sprintf("Deregistering service %s from %s", p.nodeName, p.address))
+	plog.Info(fmt.Sprintf("Deregistering service %s from %s", p.allocID, p.nodeID))
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	pod, err := p.client.CoreV1().Pods(p.retrieveNamespace()).Get(ctx, p.nodeName, metav1.GetOptions{})
+	alloc, queryMeta, err := p.client.Allocations().GetAllocation(ctx, p.allocID)
 	if err != nil {
-		return fmt.Errorf("unable to get own pod information for %s: %w", p.nodeName, err)
+		return fmt.Errorf("unable to get own alloc information for %s: %w", p.allocID, err)
 	}
 
-	labels := pod.GetLabels()
+	p.lastIndex = queryMeta.LastIndex
+
+	job := alloc.GetJob()
+	metaTags := *job.Meta
+
+	delete(metaTags, MetaCluster)
 	for _, kind := range p.knownKinds {
-		delete(labels, fmt.Sprintf("%s-%s", LabelKind, kind))
+		delete(metaTags, fmt.Sprintf("%s-%s", MetaKind, kind))
 	}
 
-	delete(labels, LabelCluster)
-	pod.SetLabels(labels)
+	job.SetMeta(metaTags)
 
-	return p.replacePodLabels(ctx, pod)
+	return p.updateJobMeta(ctx, &job)
 }
 
-// prepares a patching payload and sends it to kubernetes to replace labels
-func (p *Provider) replacePodLabels(ctx context.Context, pod *v1.Pod) error {
-	payload := []struct {
-		Op    string `json:"op"`
-		Path  string `json:"path"`
-		Value MetaTags `json:"value"`
-	}{
-		{
-			Op:    "replace",
-			Path:  "/metadata/labels",
-			Value: pod.GetLabels(),
-		},
-	}
-
-	payloadData, err := json.Marshal(payload)
+// prepares an inplace update and sends it to nomad to update job metadata
+func (p *Provider) updateJobMeta(ctx context.Context, job *models.Job) error {
+	_, writeMeta, err := p.client.Jobs().Post(ctx, job)
 	if err != nil {
-		return fmt.Errorf("unable to update pod labels, operation failed: %w", err)
+		return err
 	}
 
-	_, patcherr := p.client.CoreV1().Pods(pod.GetNamespace()).Patch(ctx, pod.GetName(), types.JSONPatchType, payloadData, metav1.PatchOptions{})
-	return patcherr
-}
+	p.lastIndex = writeMeta.LastIndex
 
-// get the namespace of the current pod
-func (p *Provider) retrieveNamespace() string {
-	if (p.namespace) == "" {
-		filename := filepath.Join(string(filepath.Separator), "var", "run", "secrets", "kubernetes.io", "serviceaccount", "namespace")
-		content, err := os.ReadFile(filename)
-		if err != nil {
-			plog.Warn(fmt.Sprintf("Could not read %s contents defaulting to empty namespace: %s", filename, err.Error()))
-			return p.namespace
-		}
-		p.namespace = string(content)
-	}
-
-	return p.namespace
+	return nil
 }
