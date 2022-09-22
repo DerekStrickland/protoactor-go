@@ -32,6 +32,7 @@ type Provider struct {
 	cluster        *cluster.Cluster
 	clusterName    string
 	nodeID         string
+	jobID          string
 	allocID        string
 	host           string
 	port           int
@@ -152,10 +153,10 @@ func (p *Provider) startClusterMonitor(c *cluster.Cluster) error {
 	// Requires operators to set node_id in the jobspec meta using node attritbute variable interpolation
 	// job "nomad-actor" {
 	//   meta {
-	//     node-id = "${node.unique.id}"
+	//     node_id = "${node.unique.id}"
 	//   }
 	// }
-	p.nodeID = os.Getenv("NOMAD_META_node-id")
+	p.nodeID = os.Getenv("NOMAD_META_node_id")
 	p.allocID = os.Getenv("NOMAD_ALLOC_ID")
 	return nil
 }
@@ -196,14 +197,19 @@ func (p *Provider) registerMember(timeout time.Duration) error {
 		metaTags[metaKey] = "true"
 	}
 
+	job, queryMeta, err := p.client.Jobs().GetJob(ctx, alloc.Job.ID)
+	if err != nil {
+		return fmt.Errorf("unable to get own job information for %s: %w", alloc.Job.ID, err)
+	}
 	// add existing meta back
-	for key, value := range *alloc.GetJob().Meta {
+	for key, value := range *job.Meta {
 		metaTags[key] = value
 	}
 
-	alloc.Job.SetMeta(metaTags)
+	p.jobID = job.ID
+	job.SetMeta(metaTags)
 
-	return p.updateJobMeta(ctx, alloc.Job)
+	return p.updateJobMeta(ctx, job)
 }
 
 func (p *Provider) startWatchingClusterAsync(c *cluster.Cluster) {
@@ -228,15 +234,23 @@ func (p *Provider) startWatchingCluster(timeout time.Duration) error {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
-		watcher, err := p.client.GetAllocations(p.retrieveNamespace()).Watch(ctx, metav1.ListOptions{LabelSelector: selector, Watch: true, TimeoutSeconds: &watchTimeoutSeconds})
+	topics:
+		map[string]string{
+			v1.TopicNode:       p.nodeID,
+			v1.TopicJob:        p.jobID,
+			v1.TopicAllocation: p.allocID,
+		}
+
+		eventStream, queryMeta, err := p.client.Events().Stream(ctx, p.lastIndex, p.clientConfig.Namespace, topics)
 		if err != nil {
-			watcherr = fmt.Errorf("unable to watch the cluster status: %w", err)
+			herr = fmt.Errorf("unable to watch the cluster status: %w", err)
 			return
 		}
+		p.lastIndex = queryMeta.LastIndex
 
 		for !p.shutdown {
 
-			event, ok := <-watcher.ResultChan()
+			event, ok := <-eventStream.ResultChan()
 			if !ok {
 				plog.Error("watcher result channel closed abruptly")
 				break
